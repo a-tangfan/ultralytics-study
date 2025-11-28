@@ -393,6 +393,7 @@ class BasePredictor:
             fp16=self.args.half,
             fuse=True,
             verbose=verbose,
+            inference_mode=getattr(self.args, "inference_mode", None),
         )
 
         self.device = self.model.device  # update device

@@ -95,6 +95,7 @@ class AutoBackend(nn.Module):
             | RKNN                  | *_rknn_model/     |
             | Triton Inference      | triton://model    |
             | ExecuTorch            | *.pte             |
+            | Axelera               | *.axm             |
 
     Attributes:
         model (torch.nn.Module): The loaded YOLO model.
@@ -144,6 +145,7 @@ class AutoBackend(nn.Module):
         fp16: bool = False,
         fuse: bool = True,
         verbose: bool = True,
+        **kwargs,
     ):
         """Initialize the AutoBackend for inference.
 
@@ -155,8 +157,14 @@ class AutoBackend(nn.Module):
             fp16 (bool): Enable half-precision inference. Supported only on specific backends.
             fuse (bool): Fuse Conv2D + BatchNorm layers for optimization.
             verbose (bool): Enable verbose logging.
+            kwargs (dict): Additional keyword arguments for configuring the backend.
         """
         super().__init__()
+        # Unified inference_mode: latency, streaming, or batch
+        self.inference_mode = kwargs.get("inference_mode", "latency").lower()
+        if self.inference_mode not in {"latency", "streaming", "batch"}:
+            LOGGER.warning(f"Unknown inference_mode '{self.inference_mode}', defaulting to 'latency'")
+            self.inference_mode = "latency"
         nn_module = isinstance(model, torch.nn.Module)
         (
             pt,
@@ -176,6 +184,7 @@ class AutoBackend(nn.Module):
             imx,
             rknn,
             pte,
+            axelera,
             triton,
         ) = self._model_type("" if nn_module else model)
         fp16 &= pt or jit or onnx or xml or engine or nn_module or triton  # FP16
@@ -251,8 +260,20 @@ class AutoBackend(nn.Module):
                     device = torch.device("cpu")
                     cuda = False
             LOGGER.info(f"Using ONNX Runtime {onnxruntime.__version__} {providers[0]}")
+
+            # ONNX inference modes
+            session_options = onnxruntime.SessionOptions()
+            if self.inference_mode == "streaming":
+                # Streaming mode: set intra_op_num_threads=1 to avoid thread oversubscription
+                # when running multiple concurrent inference requests
+                session_options.intra_op_num_threads = 1
+
             if onnx:
-                session = onnxruntime.InferenceSession(w, providers=providers)
+                session = onnxruntime.InferenceSession(w, session_options, providers=providers)
+                # Force dynamic=True for streaming mode to use session.run() instead of IOBinding.
+                # IOBinding (self.io, self.bindings) is not thread-safe for concurrent execution.
+                if self.inference_mode == "streaming":
+                    dynamic = True
             else:
                 check_requirements(
                     ("model-compression-toolkit>=2.4.1", "sony-custom-layers[torch]>=0.3.0", "onnxruntime-extensions")
@@ -312,15 +333,33 @@ class AutoBackend(nn.Module):
                 metadata = YAML.load(metadata)
                 batch = metadata["batch"]
                 dynamic = metadata.get("args", {}).get("dynamic", dynamic)
-            # OpenVINO inference modes are 'LATENCY', 'THROUGHPUT' (not recommended), or 'CUMULATIVE_THROUGHPUT'
-            inference_mode = "CUMULATIVE_THROUGHPUT" if batch > 1 and dynamic else "LATENCY"
+            # Map inference_mode to OpenVINO performance hints:
+            # - latency: "LATENCY" - optimize for single-image response time
+            # - streaming: "THROUGHPUT" - optimize for concurrent single-image requests
+            # - batch: "CUMULATIVE_THROUGHPUT" - optimize for batched tensor processing
+            if self.inference_mode == "streaming":
+                ov_hint = "THROUGHPUT"
+            elif self.inference_mode == "batch":
+                ov_hint = "CUMULATIVE_THROUGHPUT"
+            else:  # latency (default)
+                # Legacy auto-switch: if model has batch>1 and is dynamic, use CUMULATIVE_THROUGHPUT
+                if batch > 1 and dynamic:
+                    ov_hint = "CUMULATIVE_THROUGHPUT"
+                else:
+                    ov_hint = "LATENCY"
+
             ov_compiled_model = core.compile_model(
                 ov_model,
                 device_name=device_name,
-                config={"PERFORMANCE_HINT": inference_mode},
+                config={"PERFORMANCE_HINT": ov_hint},
             )
             LOGGER.info(
-                f"Using OpenVINO {inference_mode} mode for batch={batch} inference on {', '.join(ov_compiled_model.get_property('EXECUTION_DEVICES'))}..."
+                f"Using OpenVINO {ov_hint} mode (inference_mode='{self.inference_mode}') for batch={batch} "
+                f"inference on {', '.join(ov_compiled_model.get_property('EXECUTION_DEVICES'))}..."
+            )
+            # Create AsyncInferQueue for streaming and batch modes
+            self.ov_queue = (
+                ov.AsyncInferQueue(ov_compiled_model) if self.inference_mode in {"streaming", "batch"} else None
             )
             input_name = ov_compiled_model.input().get_any_name()
 
@@ -570,6 +609,12 @@ class AutoBackend(nn.Module):
             rknn_model.init_runtime()
             metadata = w.parent / "metadata.yaml"
 
+        # Axelera
+        elif axelera:
+            from axelera.runtime import op
+
+            ax_model = op.load(model)
+
         # ExecuTorch
         elif pte:
             LOGGER.info(f"Loading {w} for ExecuTorch inference...")
@@ -705,8 +750,12 @@ class AutoBackend(nn.Module):
                     """Place result in preallocated list using userdata index."""
                     results[userdata] = request.results
 
-                # Create AsyncInferQueue, set the callback and start asynchronous inference for each input image
-                async_queue = self.ov.AsyncInferQueue(self.ov_compiled_model)
+                # Use existing AsyncInferQueue or create a new one (if not initialized)
+                async_queue = (
+                    self.ov_queue
+                    if hasattr(self, "ov_queue") and self.ov_queue
+                    else self.ov.AsyncInferQueue(self.ov_compiled_model)
+                )
                 async_queue.set_callback(callback)
                 for i in range(n):
                     # Start async inference with userdata=i to specify the position in results list
@@ -790,6 +839,11 @@ class AutoBackend(nn.Module):
             im = (im.cpu().numpy() * 255).astype("uint8")
             im = im if isinstance(im, (list, tuple)) else [im]
             y = self.rknn_model.inference(inputs=im)
+
+        # Axelera
+        elif self.axelera:
+            im = im.cpu()
+            y = self.ax_model(im)
 
         # ExecuTorch
         elif self.pte:

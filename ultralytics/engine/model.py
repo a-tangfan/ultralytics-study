@@ -659,6 +659,10 @@ class Model(torch.nn.Module):
             device=args["device"],
             verbose=verbose,
             format=format,
+            inference_mode=args.get("inference_mode", "latency"),
+            processes=args.get("processes"),
+            batch_size=args.get("batch_size", 1),
+            duration=args.get("duration", 5.0),
             **export_kwargs,
         )
 
