@@ -53,8 +53,7 @@ from ultralytics.utils.torch_utils import get_cpu_info, select_device
 
 
 def _validate_config(format: str, mode: str, device: str) -> None:
-    """
-    Validate format+mode+device combination, blocking unsupported configs.
+    """Validate format+mode+device combination, blocking unsupported configs.
 
     Args:
         format (str): Export format (e.g., 'onnx', 'openvino', 'engine').
@@ -87,8 +86,7 @@ def _benchmark_multiprocess(
     duration: float,
     half: bool = False,
 ) -> dict:
-    """
-    Multi-process streaming benchmark (bypasses Python GIL).
+    """Multi-process streaming benchmark (bypasses Python GIL).
 
     Args:
         model_path (str): Path to exported model.
@@ -156,8 +154,7 @@ def _benchmark_multiprocess(
 
 
 def _benchmark_batch(model_path: str, imgsz: int, device: str, batch_size: int, duration: float) -> dict:
-    """
-    Batch processing benchmark.
+    """Batch processing benchmark.
 
     Args:
         model_path (str): Path to the exported model.
@@ -216,8 +213,7 @@ def _benchmark_streaming(
     duration: float,
     half: bool,
 ) -> dict:
-    """
-    Streaming benchmark (multi-process or async).
+    """Streaming benchmark (multi-process or async).
 
     Args:
         filename (str): Path to the exported model.
@@ -583,7 +579,7 @@ def benchmark(
             if verbose:
                 assert type(e) is AssertionError, f"Benchmark failure for {name}: {e}"
             emoji = "❌"
-            notes = f"Error: {str(e)}"
+            notes = f"Error: {e!s}"
             LOGGER.error(f"Benchmark failure for {name}: {e}")
             if inference_mode == "latency":
                 y.append([name, emoji, round(file_size(filename), 1) if filename else None, None, None, None])
@@ -641,7 +637,6 @@ def benchmark(
             assert all(x > floor for x in metrics if not np.isnan(x)), f"Benchmark failure: metric(s) < floor {floor}"
 
     return df_display
-
 
 
 class RF100Benchmark:

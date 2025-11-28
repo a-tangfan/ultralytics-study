@@ -260,7 +260,7 @@ class AutoBackend(nn.Module):
                     device = torch.device("cpu")
                     cuda = False
             LOGGER.info(f"Using ONNX Runtime {onnxruntime.__version__} {providers[0]}")
-            
+
             # ONNX inference modes
             session_options = onnxruntime.SessionOptions()
             if self.inference_mode == "streaming":
@@ -358,7 +358,9 @@ class AutoBackend(nn.Module):
                 f"inference on {', '.join(ov_compiled_model.get_property('EXECUTION_DEVICES'))}..."
             )
             # Create AsyncInferQueue for streaming and batch modes
-            self.ov_queue = ov.AsyncInferQueue(ov_compiled_model) if self.inference_mode in {"streaming", "batch"} else None
+            self.ov_queue = (
+                ov.AsyncInferQueue(ov_compiled_model) if self.inference_mode in {"streaming", "batch"} else None
+            )
             input_name = ov_compiled_model.input().get_any_name()
 
         # TensorRT
@@ -749,7 +751,11 @@ class AutoBackend(nn.Module):
                     results[userdata] = request.results
 
                 # Use existing AsyncInferQueue or create a new one (if not initialized)
-                async_queue = self.ov_queue if hasattr(self, "ov_queue") and self.ov_queue else self.ov.AsyncInferQueue(self.ov_compiled_model)
+                async_queue = (
+                    self.ov_queue
+                    if hasattr(self, "ov_queue") and self.ov_queue
+                    else self.ov.AsyncInferQueue(self.ov_compiled_model)
+                )
                 async_queue.set_callback(callback)
                 for i in range(n):
                     # Start async inference with userdata=i to specify the position in results list
