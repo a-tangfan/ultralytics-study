@@ -44,11 +44,289 @@ import torch.cuda
 from ultralytics import YOLO, YOLOWorld
 from ultralytics.cfg import TASK2DATA, TASK2METRIC
 from ultralytics.engine.exporter import export_formats
+from ultralytics.nn.autobackend import AutoBackend
 from ultralytics.utils import ARM64, ASSETS, ASSETS_URL, IS_JETSON, LINUX, LOGGER, MACOS, TQDM, WEIGHTS_DIR, YAML
 from ultralytics.utils.checks import IS_PYTHON_3_13, check_imgsz, check_requirements, check_yolo, is_rockchip
 from ultralytics.utils.downloads import safe_download
 from ultralytics.utils.files import file_size
 from ultralytics.utils.torch_utils import get_cpu_info, select_device
+
+
+def _validate_config(format: str, mode: str, device: str) -> None:
+    """
+    Validate format+mode+device combination, blocking unsupported configs.
+
+    Args:
+        format (str): Export format (e.g., 'onnx', 'openvino', 'engine').
+        mode (str): Inference mode ('latency', 'streaming', 'batch').
+        device (str): Device string (e.g., 'cpu', 'cuda', 'cuda:0').
+
+    Raises:
+        NotImplementedError: If the combination is unsupported.
+    """
+    device_str = str(device).lower()
+    device_type = "gpu" if "cuda" in device_str else "cpu"
+
+    if mode == "streaming" and device_type == "gpu":
+        raise NotImplementedError(
+            "Streaming mode is unsupported on GPU devices (high VRAM overhead per process). "
+            "Recommendation: Use inference_mode='batch' for GPU."
+        )
+    elif mode == "batch" and device_type == "cpu":
+        LOGGER.warning(
+            "Batch mode on CPU is less efficient than streaming. "
+            "Consider using inference_mode='streaming' for multi-core CPUs."
+        )
+
+
+def _benchmark_multiprocess(
+    model_path: str,
+    imgsz: int,
+    device: str,
+    processes: int | None,
+    duration: float,
+    half: bool = False,
+) -> dict:
+    """
+    Multi-process streaming benchmark (bypasses Python GIL).
+
+    Args:
+        model_path (str): Path to exported model.
+        imgsz (int): Image size.
+        device (str): Device string.
+        processes (int | None): Worker count (default: CPU count).
+        duration (float): Benchmark duration in seconds.
+        half (bool): Use FP16.
+
+    Returns:
+        (dict): Metrics with total_fps, frames_total, duration, workers.
+    """
+    import multiprocessing as mp
+
+    processes = processes or mp.cpu_count()
+
+    def worker(model_path, imgsz, duration, device, half, queue):
+        """Worker process."""
+        try:
+            model = YOLO(model_path)
+            dummy_input = np.random.randint(0, 255, (imgsz, imgsz, 3), dtype=np.uint8)
+
+            for _ in range(3):
+                model(dummy_input, verbose=False, half=half)
+
+            count = 0
+            start_time = time.time()
+            while time.time() < start_time + duration:
+                model(dummy_input, verbose=False, half=half)
+                count += 1
+
+            queue.put({"count": count, "elapsed": time.time() - start_time})
+        except Exception as e:
+            queue.put({"error": str(e)})
+
+    queue = mp.Queue()
+    workers_list = [
+        mp.Process(target=worker, args=(model_path, imgsz, duration, device, half, queue)) for _ in range(processes)
+    ]
+
+    for p in workers_list:
+        p.start()
+    for p in workers_list:
+        p.join()
+
+    total_frames, total_elapsed, errors = 0, 0, []
+    for _ in range(processes):
+        result = queue.get()
+        if "error" in result:
+            errors.append(result["error"])
+        else:
+            total_frames += result["count"]
+            total_elapsed = max(total_elapsed, result["elapsed"])
+
+    if errors:
+        raise RuntimeError(f"Worker errors: {errors}")
+
+    return {
+        "total_fps": round(total_frames / total_elapsed, 2) if total_elapsed > 0 else 0,
+        "frames_total": total_frames,
+        "duration": round(total_elapsed, 2),
+        "workers": processes,
+        "method": "Multi-Process",
+    }
+
+
+def _benchmark_batch(model_path: str, imgsz: int, device: str, batch_size: int, duration: float) -> dict:
+    """
+    Batch processing benchmark.
+
+    Args:
+        model_path (str): Path to the exported model.
+        imgsz (int): Image size for inference.
+        device (str): Device string.
+        batch_size (int): Number of images per batch.
+        duration (float): Benchmark duration in seconds.
+
+    Returns:
+        (dict): Benchmark metrics including total_fps, frames_total, duration, batch_size.
+    """
+    # Load model
+    model = YOLO(model_path)
+
+    # Generate dummy batch ONCE
+    if "cuda" in str(device).lower():
+        # For GPU: generate directly on device
+        dummy_batch = torch.randint(0, 255, (batch_size, imgsz, imgsz, 3), dtype=torch.uint8, device=device)
+    else:
+        # For CPU: generate in NumPy
+        dummy_batch = [np.random.randint(0, 255, (imgsz, imgsz, 3), dtype=np.uint8) for _ in range(batch_size)]
+
+    # Warmup
+    for _ in range(3):
+        model(dummy_batch, verbose=False)
+
+    # Benchmark
+    count = 0
+    start_time = time.time()
+    end_time = start_time + duration
+
+    while time.time() < end_time:
+        model(dummy_batch, verbose=False)
+        count += 1
+
+    elapsed = time.time() - start_time
+    total_frames = count * batch_size
+    fps = total_frames / elapsed if elapsed > 0 else 0
+
+    return {
+        "total_fps": round(fps, 2),
+        "frames_total": total_frames,
+        "duration": round(elapsed, 2),
+        "batch_size": batch_size,
+        "batches": count,
+        "method": "Batched Inference",
+    }
+
+
+def _benchmark_streaming(
+    filename: str,
+    imgsz: int,
+    device: str,
+    format: str,
+    processes: int | None,
+    duration: float,
+    half: bool,
+) -> dict:
+    """
+    Streaming benchmark (multi-process or async).
+
+    Args:
+        filename (str): Path to the exported model.
+        imgsz (int): Image size.
+        device (str): Device string.
+        format (str): Export format.
+        processes (int | None): Worker count.
+        duration (float): Duration in seconds.
+        half (bool): Use FP16.
+
+    Returns:
+        (dict): Metrics.
+    """
+    # Detect backend type
+    if format == "openvino":
+        backend_type = "openvino"
+    elif format == "onnx":
+        backend_type = "onnx"
+    else:
+        backend_type = "generic"
+
+    if backend_type == "openvino":
+        # OpenVINO streaming using AutoBackend and persistent AsyncInferQueue
+        num_requests = processes or 8
+        backend_model = AutoBackend(
+            str(filename),
+            device=torch.device("cpu"),
+            verbose=False,
+            inference_mode="streaming",
+        )
+
+        # Queue should have been initialized by AutoBackend
+        async_queue = getattr(backend_model, "ov_queue", None)
+        if not async_queue:
+            raise RuntimeError("AutoBackend failed to initialize OpenVINO AsyncInferQueue.")
+
+        input_tensor = np.random.randint(0, 255, (1, 3, imgsz, imgsz), dtype=np.uint8)
+
+        # Warmup
+        for _ in range(num_requests * 2):
+            async_queue.start_async({0: input_tensor})
+        async_queue.wait_all()
+
+        frame_count = 0
+
+        def completion_callback(infer_request, userdata):
+            nonlocal frame_count
+            frame_count += 1
+
+        async_queue.set_callback(completion_callback)
+
+        start_time = time.time()
+        while time.time() < start_time + duration:
+            async_queue.start_async({0: input_tensor})
+        async_queue.wait_all()
+
+        elapsed = time.time() - start_time
+        return {
+            "total_fps": round(frame_count / elapsed, 2) if elapsed > 0 else 0,
+            "frames_total": frame_count,
+            "duration": round(elapsed, 2),
+            "workers": num_requests,
+            "method": "OpenVINO AsyncInferQueue+THROUGHPUT (AutoBackend)",
+        }
+
+    elif backend_type == "onnx":
+        # ONNX streaming using AutoBackend and ThreadPoolExecutor
+        from concurrent.futures import ThreadPoolExecutor
+
+        num_workers = processes or 8
+
+        # Initialize AutoBackend with streaming mode (sets intra_op_num_threads=1)
+        backend_model = AutoBackend(
+            str(filename), device=select_device(device), verbose=False, inference_mode="streaming"
+        )
+        session = backend_model.session
+        input_name = session.get_inputs()[0].name
+        dummy_input = np.random.rand(1, 3, imgsz, imgsz).astype(np.float32)
+
+        def worker(duration):
+            """Worker thread for ONNX inference."""
+            count = 0
+            start = time.time()
+            while time.time() - start < duration:
+                session.run(None, {input_name: dummy_input})
+                count += 1
+            return count
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(worker, duration) for _ in range(num_workers)]
+            results = [f.result() for f in futures]
+
+        total_frames = sum(results)
+        return {
+            "total_fps": round(total_frames / duration, 2) if duration > 0 else 0,
+            "frames_total": total_frames,
+            "duration": round(duration, 2),
+            "workers": num_workers,
+            "method": "ONNX ThreadPoolExecutor (AutoBackend)",
+        }
+    else:
+        return _benchmark_multiprocess(
+            model_path=str(filename),
+            imgsz=imgsz,
+            device=str(device),
+            processes=processes,
+            duration=duration,
+            half=half,
+        )
 
 
 def benchmark(
@@ -61,6 +339,10 @@ def benchmark(
     verbose=False,
     eps=1e-3,
     format="",
+    inference_mode="latency",
+    processes=None,
+    batch_size=1,
+    duration=5.0,
     **kwargs,
 ):
     """Benchmark a YOLO model across different formats for speed and accuracy.
@@ -75,6 +357,13 @@ def benchmark(
         verbose (bool | float): If True or a float, assert benchmarks pass with given metric.
         eps (float): Epsilon value for divide by zero prevention.
         format (str): Export format for benchmarking. If not supplied all formats are benchmarked.
+        inference_mode (str): Inference mode - 'latency' (default), 'streaming', or 'batch'.
+            - 'latency': Single image inference time (original behavior)
+            - 'streaming': Concurrent inference throughput (multi-process or async)
+            - 'batch': Batched inference throughput
+        processes (int | None): Number of worker processes/threads for streaming. If None, uses CPU count.
+        batch_size (int): Batch size for batch mode. Default is 1.
+        duration (float): Benchmark duration in seconds for streaming/batch. Default is 5.0.
         **kwargs (Any): Additional keyword arguments for exporter.
 
     Returns:
@@ -82,9 +371,15 @@ def benchmark(
             inference time.
 
     Examples:
-        Benchmark a YOLO model with default settings:
+        Benchmark with default latency mode:
         >>> from ultralytics.utils.benchmarks import benchmark
         >>> benchmark(model="yolo11n.pt", imgsz=640)
+
+        Benchmark with streaming mode (multi-process):
+        >>> benchmark(model="yolo11n.pt", imgsz=640, inference_mode="streaming", processes=8, duration=10.0)
+
+        Benchmark with batch mode:
+        >>> benchmark(model="yolo11n.pt", imgsz=640, inference_mode="batch", batch_size=8, duration=10.0)
     """
     imgsz = check_imgsz(imgsz)
     assert imgsz[0] == imgsz[1] if isinstance(imgsz, list) else True, "benchmark() only supports square imgsz."
@@ -112,11 +407,25 @@ def benchmark(
     if format_arg:
         formats = frozenset(export_formats()["Argument"])
         assert format in formats, f"Expected format to be one of {formats}, but got '{format_arg}'."
+
+    # Validate inference_mode parameter
+    valid_modes = {"latency", "streaming", "batch"}
+    if inference_mode not in valid_modes:
+        raise ValueError(f"Invalid inference_mode '{inference_mode}'. Must be one of {valid_modes}.")
+
     for name, format, suffix, cpu, gpu, _ in zip(*export_formats().values()):
         emoji, filename = "❌", None  # export defaults
+        notes = ""
+        metric_value = None
+        speed_value = None
+        fps_value = None
+
         try:
             if format_arg and format_arg != format:
                 continue
+
+            # === STEP 1: STRICT VALIDATION (The Guard Rail) ===
+            _validate_config(format=format, mode=inference_mode, device=str(device))
 
             # Checks
             if format == "pb":
@@ -131,7 +440,6 @@ def benchmark(
                 assert not IS_PYTHON_3_13, "CoreML not supported on Python 3.13"
             if format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:
                 assert not isinstance(model, YOLOWorld), "YOLOWorldv2 TensorFlow exports not supported by onnx2tf yet"
-                # assert not IS_PYTHON_MINIMUM_3_12, "TFLite exports not supported on Python>=3.12 yet"
             if format == "paddle":
                 assert not isinstance(model, YOLOWorld), "YOLOWorldv2 Paddle exports not supported yet"
                 assert model.task != "obb", "Paddle OBB bug https://github.com/PaddlePaddle/Paddle/issues/72024"
@@ -161,7 +469,7 @@ def benchmark(
             if "cuda" in device.type:
                 assert gpu, "inference not supported on GPU"
 
-            # Export
+            # === STEP 2: EXPORT MODEL ===
             if format == "-":
                 filename = model.pt_path or model.ckpt_path or model.model_name
                 exported_model = model  # PyTorch format
@@ -173,56 +481,167 @@ def benchmark(
                 assert suffix in str(filename), "export failed"
             emoji = "❎"  # indicates export succeeded
 
-            # Predict
-            assert model.task != "pose" or format != "pb", "GraphDef Pose inference is not supported"
-            assert model.task != "pose" or format != "executorch", "ExecuTorch Pose inference is not supported"
-            assert format not in {"edgetpu", "tfjs"}, "inference not supported"
-            assert format != "coreml" or platform.system() == "Darwin", "inference only supported on macOS>=10.13"
-            if format == "ncnn":
-                assert not is_end2end, "End-to-end torch.topk operation is not supported for NCNN prediction yet"
-            exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
+            # === STEP 3: EXECUTE BENCHMARK (Mode-Dependent) ===
+            if inference_mode == "latency":
+                # Original latency benchmark (unchanged)
+                assert model.task != "pose" or format != "pb", "GraphDef Pose inference is not supported"
+                assert model.task != "pose" or format != "executorch", "ExecuTorch Pose inference is not supported"
+                assert format not in {"edgetpu", "tfjs"}, "inference not supported"
+                assert format != "coreml" or platform.system() == "Darwin", "inference only supported on macOS>=10.13"
+                if format == "ncnn":
+                    assert not is_end2end, "End-to-end torch.topk operation is not supported for NCNN prediction yet"
+                exported_model.predict(ASSETS / "bus.jpg", imgsz=imgsz, device=device, half=half, verbose=False)
 
-            # Validate
-            results = exported_model.val(
-                data=data,
-                batch=1,
-                imgsz=imgsz,
-                plots=False,
-                device=device,
-                half=half,
-                int8=int8,
-                verbose=False,
-                conf=0.001,  # all the pre-set benchmark mAP values are based on conf=0.001
-            )
-            metric, speed = results.results_dict[key], results.speed["inference"]
-            fps = round(1000 / (speed + eps), 2)  # frames per second
-            y.append([name, "✅", round(file_size(filename), 1), round(metric, 4), round(speed, 2), fps])
+                # Validate
+                results = exported_model.val(
+                    data=data,
+                    batch=1,
+                    imgsz=imgsz,
+                    plots=False,
+                    device=device,
+                    half=half,
+                    int8=int8,
+                    verbose=False,
+                    conf=0.001,
+                )
+                metric_value = results.results_dict[key]
+                speed_value = results.speed["inference"]
+                fps_value = round(1000 / (speed_value + eps), 2)
+                emoji = "✅"
+
+            elif inference_mode == "streaming":
+                metrics = _benchmark_streaming(
+                    filename=filename,
+                    imgsz=imgsz if isinstance(imgsz, int) else imgsz[0],
+                    device=str(device),
+                    format=format,
+                    processes=processes,
+                    duration=duration,
+                    half=half,
+                )
+                fps_value = metrics["total_fps"]
+                notes = f"{metrics['workers']} workers, {metrics['method']}"
+                emoji = "✅"
+
+            elif inference_mode == "batch":
+                # Batch benchmark requires dynamic batch export for ONNX/OpenVINO
+                # Re-export with dynamic=True if needed
+                if format in {"onnx", "openvino"} and batch_size > 1:
+                    LOGGER.info(f"Re-exporting {format} with dynamic=True for batch mode...")
+                    kwargs["dynamic"] = True
+                    filename = model.export(
+                        imgsz=imgsz,
+                        format=format,
+                        half=half,
+                        int8=int8,
+                        data=data,
+                        device=device,
+                        verbose=False,
+                        **kwargs,
+                    )
+
+                # Batch benchmark
+                metrics = _benchmark_batch(
+                    model_path=str(filename),
+                    imgsz=imgsz if isinstance(imgsz, int) else imgsz[0],
+                    device=str(device),
+                    batch_size=batch_size,
+                    duration=duration,
+                )
+                fps_value = metrics["total_fps"]
+                notes = f"batch_size={batch_size}, {metrics['batches']} batches"
+                emoji = "✅"
+
+            # Append result based on mode
+            if inference_mode == "latency":
+                y.append(
+                    [
+                        name,
+                        emoji,
+                        round(file_size(filename), 1),
+                        round(metric_value, 4),
+                        round(speed_value, 2),
+                        fps_value,
+                    ]
+                )
+            else:
+                # For streaming/batch, we don't compute mAP
+                y.append([name, emoji, round(file_size(filename), 1), None, None, fps_value, notes])
+
+        except NotImplementedError as e:
+            # === EXPLICIT SKIP (Intentional - No Fallback) ===
+            emoji = "⛔"
+            notes = str(e)
+            LOGGER.warning(f"{name}: {notes}")
+            if inference_mode == "latency":
+                y.append([name, emoji, round(file_size(filename), 1) if filename else None, None, None, None])
+            else:
+                y.append([name, emoji, round(file_size(filename), 1) if filename else None, None, None, None, notes])
+
         except Exception as e:
+            # === GENUINE FAILURE ===
             if verbose:
                 assert type(e) is AssertionError, f"Benchmark failure for {name}: {e}"
+            emoji = "❌"
+            notes = f"Error: {str(e)}"
             LOGGER.error(f"Benchmark failure for {name}: {e}")
-            y.append([name, emoji, round(file_size(filename), 1), None, None, None])  # mAP, t_inference
+            if inference_mode == "latency":
+                y.append([name, emoji, round(file_size(filename), 1) if filename else None, None, None, None])
+            else:
+                y.append([name, emoji, round(file_size(filename), 1) if filename else None, None, None, None, notes])
 
     # Print results
     check_yolo(device=device)  # print system info
-    df = pl.DataFrame(y, schema=["Format", "Status❔", "Size (MB)", key, "Inference time (ms/im)", "FPS"], orient="row")
+
+    # Create DataFrame with appropriate schema based on mode
+    if inference_mode == "latency":
+        df = pl.DataFrame(
+            y, schema=["Format", "Status❔", "Size (MB)", key, "Inference time (ms/im)", "FPS"], orient="row"
+        )
+        legend = "Benchmarks legend:  - ✅ Success  - ❎ Export passed but validation failed  - ❌️ Export failed"
+    else:
+        # For streaming/batch modes
+        df = pl.DataFrame(
+            y,
+            schema=["Format", "Status❔", "Size (MB)", key, "Inference time (ms/im)", "FPS", "Notes"],
+            orient="row",
+        )
+        legend = (
+            "Benchmarks legend:  - ✅ Success  - ⛔ Unsupported (intentional skip)  "
+            "- ❎ Export passed but validation failed  - ❌️ Export failed"
+        )
+
     df = df.with_row_index(" ", offset=1)  # add index info
     df_display = df.with_columns(pl.all().cast(pl.String).fill_null("-"))
 
     name = model.model_name
     dt = time.time() - t0
-    legend = "Benchmarks legend:  - ✅ Success  - ❎ Export passed but validation failed  - ❌️ Export failed"
-    s = f"\nBenchmarks complete for {name} on {data} at imgsz={imgsz} ({dt:.2f}s)\n{legend}\n{df_display}\n"
+
+    # Mode-specific header
+    if inference_mode == "latency":
+        mode_info = "inference_mode=latency (single image inference)"
+    elif inference_mode == "streaming":
+        proc_info = f"processes={processes or 'auto'}" if processes else "processes=auto"
+        mode_info = f"inference_mode=streaming ({proc_info}, duration={duration}s)"
+    else:  # batch
+        mode_info = f"inference_mode=batch (batch_size={batch_size}, duration={duration}s)"
+
+    s = (
+        f"\nBenchmarks complete for {name} on {data} at imgsz={imgsz} ({dt:.2f}s)\n"
+        f"Mode: {mode_info}\n{legend}\n{df_display}\n"
+    )
     LOGGER.info(s)
     with open("benchmarks.log", "a", errors="ignore", encoding="utf-8") as f:
         f.write(s)
 
     if verbose and isinstance(verbose, float):
-        metrics = df[key].to_numpy()  # values to compare to floor
-        floor = verbose  # minimum metric floor to pass, i.e. = 0.29 mAP for YOLOv5n
-        assert all(x > floor for x in metrics if not np.isnan(x)), f"Benchmark failure: metric(s) < floor {floor}"
+        if inference_mode == "latency":
+            metrics = df[key].to_numpy()  # values to compare to floor
+            floor = verbose  # minimum metric floor to pass, i.e. = 0.29 mAP for YOLOv5n
+            assert all(x > floor for x in metrics if not np.isnan(x)), f"Benchmark failure: metric(s) < floor {floor}"
 
     return df_display
+
 
 
 class RF100Benchmark:

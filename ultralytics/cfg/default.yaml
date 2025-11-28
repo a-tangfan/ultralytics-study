@@ -128,3 +128,9 @@ cfg: # (str, optional) path to a config.yaml that overrides defaults
 
 # Tracker settings ------------------------------------------------------------------------------------------------------
 tracker: botsort.yaml # (str) tracker config file: botsort.yaml or bytetrack.yaml
+
+# Inference and Benchmark settings --------------------------------------------------------------------------------------
+inference_mode: latency # (str) inference mode: latency, streaming, or batch
+processes: # (int, optional) worker count for streaming mode; defaults to CPU count
+batch_size: 1 # (int) batch size for batch mode
+duration: 5.0 # (float) benchmark duration in seconds for streaming/batch modes

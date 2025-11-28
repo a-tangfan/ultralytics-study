@@ -159,6 +159,7 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
+        "duration",  # benchmark duration in seconds
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -201,6 +202,8 @@ CFG_INT_KEYS = frozenset(
         "line_width",
         "nbs",
         "save_period",
+        "processes",  # benchmark worker count
+        "batch_size",  # benchmark batch size
     }
 )
 CFG_BOOL_KEYS = frozenset(
